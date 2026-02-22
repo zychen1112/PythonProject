@@ -5,7 +5,7 @@ Agent - The main AI agent class.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Optional
 
 from pydantic import BaseModel, Field
 
@@ -13,6 +13,16 @@ from pyagent.core.context import Context
 from pyagent.core.executor import Executor
 from pyagent.core.message import Message, ToolUseContent
 from pyagent.core.tools import Tool
+from pyagent.hooks import (
+    HookAbortError,
+    HookContext,
+    HookExecutor,
+    HookPosition,
+    HookRegistry,
+    HookResult,
+    HookRetryError,
+    HookSkipError,
+)
 
 if TYPE_CHECKING:
     from pyagent.mcp.client import MCPClient
@@ -33,6 +43,9 @@ class AgentConfig(BaseModel):
 class Agent:
     """
     Main AI Agent class that orchestrates LLM calls, tool execution, and skill invocation.
+
+    The agent now supports a hooks system that allows injecting custom logic at
+    various points in the execution lifecycle.
     """
 
     def __init__(
@@ -43,12 +56,17 @@ class Agent:
         skills: list["Skill"] | None = None,
         mcp_clients: list["MCPClient"] | None = None,
         context: Context | None = None,
+        hooks_registry: HookRegistry | None = None,
     ):
         self.provider = provider
         self.config = config or AgentConfig()
         self.context = context or Context()
         self.executor = Executor(self.context)
         self.mcp_clients = mcp_clients or []
+
+        # Initialize hooks system
+        self.hooks = hooks_registry or HookRegistry()
+        self.hook_executor = HookExecutor(self.hooks)
 
         # Register tools
         if tools:
@@ -63,6 +81,82 @@ class Agent:
         # Set up system prompt
         if self.config.system_prompt:
             self.context.add_system_message(self.config.system_prompt)
+
+    def hook(self, position: HookPosition, priority: int = 100, name: Optional[str] = None):
+        """Decorator method to register a hook on this agent.
+
+        Args:
+            position: The hook position in the lifecycle
+            priority: Execution priority (lower = earlier)
+            name: Optional name for the hook
+
+        Returns:
+            Decorator function
+
+        Example:
+            @agent.hook(HookPosition.ON_TOOL_CALL)
+            async def log_tools(ctx):
+                print(f"Tool: {ctx.tool_name}")
+                return HookResult.continue_()
+        """
+        return self.hooks.hook(position, priority, name)
+
+    def register_hook(
+        self,
+        hook: "BaseHook",
+        position: Optional[HookPosition] = None,
+        priority: Optional[int] = None,
+        name: Optional[str] = None,
+    ) -> str:
+        """Register a hook instance on this agent.
+
+        Args:
+            hook: The hook instance to register
+            position: Override hook position (optional)
+            priority: Override hook priority (optional)
+            name: Optional name for the hook
+
+        Returns:
+            The name of the registered hook
+        """
+        return self.hooks.register(hook, position, priority, name)
+
+    async def _execute_hook(
+        self,
+        position: HookPosition,
+        context: HookContext,
+    ) -> HookResult:
+        """Execute hooks at a position with error handling.
+
+        Args:
+            position: The hook position
+            context: The execution context
+
+        Returns:
+            HookResult from the execution
+        """
+        return await self.hook_executor.execute_safe(position, context)
+
+    def _create_hook_context(
+        self,
+        position: HookPosition,
+        **kwargs,
+    ) -> HookContext:
+        """Create a hook context with common fields.
+
+        Args:
+            position: The hook position
+            **kwargs: Additional context fields
+
+        Returns:
+            HookContext instance
+        """
+        return HookContext(
+            agent_id=self.config.name,
+            position=position,
+            messages=list(self.context.messages),
+            **kwargs,
+        )
 
     def add_tool(self, tool: Tool) -> None:
         """Add a tool to the agent."""
@@ -130,67 +224,175 @@ class Agent:
         Returns:
             Agent's response text
         """
+        # Hook: ON_RUN_START
+        ctx = self._create_hook_context(
+            HookPosition.ON_RUN_START,
+            message=message,
+        )
+        hook_result = await self._execute_hook(HookPosition.ON_RUN_START, ctx)
+        if hook_result.is_abort():
+            return hook_result.message or "Execution aborted by hook"
+
         # Add user message to context
         self.context.add_user_message(message)
 
+        # Hook: ON_MESSAGE
+        msg_ctx = self._create_hook_context(HookPosition.ON_MESSAGE, message=message)
+        await self._execute_hook(HookPosition.ON_MESSAGE, msg_ctx)
+
         iteration = 0
+        final_response = None
+
         while iteration < self.config.max_iterations:
             iteration += 1
 
-            # Get completion from LLM
-            response = await self.provider.complete(
-                messages=self.context.get_api_messages(),
-                tools=self.context.get_tools_api_format(),
-                model=self.config.model,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens
+            # Hook: ON_ITERATION_START
+            iter_ctx = self._create_hook_context(
+                HookPosition.ON_ITERATION_START,
+                iteration=iteration,
             )
+            hook_result = await self._execute_hook(HookPosition.ON_ITERATION_START, iter_ctx)
+            if hook_result.is_abort():
+                return hook_result.message or "Execution aborted by hook"
 
-            # Extract content and tool calls
-            assistant_message = response.get("message")
-            tool_calls = response.get("tool_calls", [])
+            try:
+                # Hook: ON_LLM_CALL
+                llm_ctx = self._create_hook_context(
+                    HookPosition.ON_LLM_CALL,
+                    iteration=iteration,
+                )
+                hook_result = await self._execute_hook(HookPosition.ON_LLM_CALL, llm_ctx)
 
-            # Add assistant message to context
-            if assistant_message:
-                self.context.add_message(assistant_message)
+                if hook_result.is_retry():
+                    # Handle retry
+                    await asyncio.sleep(hook_result.data.get("after_seconds", 0))
+                    iteration -= 1  # Retry same iteration
+                    continue
 
-            # If no tool calls, we're done
-            if not tool_calls:
-                # Return the text content
-                content = assistant_message.content if assistant_message else ""
-                if isinstance(content, str):
-                    return content
-                else:
-                    # Extract text from content blocks
-                    texts = []
-                    for block in content:
-                        if hasattr(block, 'text'):
-                            texts.append(block.text)
-                    return "\n".join(texts)
+                if hook_result.is_abort():
+                    return hook_result.message or "Execution aborted by hook"
 
-            # Execute tool calls
-            for tool_call in tool_calls:
-                tool_name = tool_call["name"]
-                tool_args = tool_call["input"]
-                tool_id = tool_call["id"]
-
-                if on_tool_call:
-                    on_tool_call(tool_name, tool_args)
-
-                # Execute tool
-                _, result = await self.executor.execute_tool(
-                    tool_name, tool_args, tool_id
+                # Get completion from LLM
+                response = await self.provider.complete(
+                    messages=self.context.get_api_messages(),
+                    tools=self.context.get_tools_api_format(),
+                    model=self.config.model,
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens
                 )
 
-                # Add result to context
-                self.context.add_message(Message.tool_result(
-                    tool_use_id=tool_id,
-                    content=result.content,
-                    is_error=result.is_error,
-                    name=result.tool_name
-                ))
+                # Hook: ON_LLM_RESPONSE
+                resp_ctx = self._create_hook_context(
+                    HookPosition.ON_LLM_RESPONSE,
+                    iteration=iteration,
+                    llm_response=response,
+                )
+                await self._execute_hook(HookPosition.ON_LLM_RESPONSE, resp_ctx)
 
-        return "Max iterations reached without completion."
+                # Extract content and tool calls
+                assistant_message = response.get("message")
+                tool_calls = response.get("tool_calls", [])
+
+                # Add assistant message to context
+                if assistant_message:
+                    self.context.add_message(assistant_message)
+
+                # If no tool calls, we're done
+                if not tool_calls:
+                    # Return the text content
+                    content = assistant_message.content if assistant_message else ""
+                    if isinstance(content, str):
+                        final_response = content
+                    else:
+                        # Extract text from content blocks
+                        texts = []
+                        for block in content:
+                            if hasattr(block, 'text'):
+                                texts.append(block.text)
+                        final_response = "\n".join(texts)
+                    break
+
+                # Execute tool calls
+                for tool_call in tool_calls:
+                    tool_name = tool_call["name"]
+                    tool_args = tool_call["input"]
+                    tool_id = tool_call["id"]
+
+                    # Hook: ON_TOOL_CALL
+                    tool_ctx = self._create_hook_context(
+                        HookPosition.ON_TOOL_CALL,
+                        iteration=iteration,
+                        tool_name=tool_name,
+                        tool_arguments=tool_args,
+                    )
+                    hook_result = await self._execute_hook(HookPosition.ON_TOOL_CALL, tool_ctx)
+
+                    if hook_result.is_skip():
+                        continue
+
+                    if hook_result.is_abort():
+                        return hook_result.message or "Execution aborted by hook"
+
+                    if on_tool_call:
+                        on_tool_call(tool_name, tool_args)
+
+                    # Execute tool
+                    try:
+                        _, result = await self.executor.execute_tool(
+                            tool_name, tool_args, tool_id
+                        )
+
+                        # Hook: ON_TOOL_RESULT
+                        result_ctx = self._create_hook_context(
+                            HookPosition.ON_TOOL_RESULT,
+                            iteration=iteration,
+                            tool_name=tool_name,
+                            tool_arguments=tool_args,
+                            tool_result=result,
+                        )
+                        await self._execute_hook(HookPosition.ON_TOOL_RESULT, result_ctx)
+
+                        # Add result to context
+                        self.context.add_message(Message.tool_result(
+                            tool_use_id=tool_id,
+                            content=result.content,
+                            is_error=result.is_error,
+                            name=result.tool_name
+                        ))
+
+                    except Exception as e:
+                        # Hook: ON_ERROR
+                        error_ctx = self._create_hook_context(
+                            HookPosition.ON_ERROR,
+                            iteration=iteration,
+                            error=e,
+                            tool_name=tool_name,
+                        )
+                        hook_result = await self._execute_hook(HookPosition.ON_ERROR, error_ctx)
+
+                        if hook_result.is_retry():
+                            await asyncio.sleep(hook_result.data.get("after_seconds", 0))
+                            continue
+
+                        # Re-raise if not handled
+                        raise
+
+            finally:
+                # Hook: ON_ITERATION_END
+                end_ctx = self._create_hook_context(
+                    HookPosition.ON_ITERATION_END,
+                    iteration=iteration,
+                )
+                await self._execute_hook(HookPosition.ON_ITERATION_END, end_ctx)
+
+        # Hook: ON_RUN_END
+        end_ctx = self._create_hook_context(
+            HookPosition.ON_RUN_END,
+            message=final_response or "Max iterations reached",
+        )
+        await self._execute_hook(HookPosition.ON_RUN_END, end_ctx)
+
+        return final_response or "Max iterations reached without completion."
 
     async def run_stream(
         self,
@@ -207,65 +409,173 @@ class Agent:
         Yields:
             Chunks of the agent's response
         """
+        # Hook: ON_RUN_START
+        ctx = self._create_hook_context(
+            HookPosition.ON_RUN_START,
+            message=message,
+        )
+        hook_result = await self._execute_hook(HookPosition.ON_RUN_START, ctx)
+        if hook_result.is_abort():
+            yield hook_result.message or "Execution aborted by hook"
+            return
+
         # Add user message to context
         self.context.add_user_message(message)
 
+        # Hook: ON_MESSAGE
+        msg_ctx = self._create_hook_context(HookPosition.ON_MESSAGE, message=message)
+        await self._execute_hook(HookPosition.ON_MESSAGE, msg_ctx)
+
         iteration = 0
+
         while iteration < self.config.max_iterations:
             iteration += 1
+
+            # Hook: ON_ITERATION_START
+            iter_ctx = self._create_hook_context(
+                HookPosition.ON_ITERATION_START,
+                iteration=iteration,
+            )
+            hook_result = await self._execute_hook(HookPosition.ON_ITERATION_START, iter_ctx)
+            if hook_result.is_abort():
+                yield hook_result.message or "Execution aborted by hook"
+                return
 
             full_response = ""
             tool_calls = []
 
-            # Stream completion from LLM
-            async for chunk in self.provider.stream(
-                messages=self.context.get_api_messages(),
-                tools=self.context.get_tools_api_format(),
-                model=self.config.model,
-                temperature=self.config.temperature,
-                max_tokens=self.config.max_tokens
-            ):
-                # Check if it's a text chunk or tool call info
-                if isinstance(chunk, dict):
-                    if "text" in chunk:
-                        text = chunk["text"]
-                        full_response += text
-                        yield text
-                    elif "tool_call" in chunk:
-                        tool_calls.append(chunk["tool_call"])
-                elif isinstance(chunk, str):
-                    full_response += chunk
-                    yield chunk
-
-            # Add assistant message
-            if full_response:
-                self.context.add_assistant_message(full_response)
-
-            # If no tool calls, we're done
-            if not tool_calls:
-                return
-
-            # Execute tool calls
-            for tool_call in tool_calls:
-                tool_name = tool_call["name"]
-                tool_args = tool_call["input"]
-                tool_id = tool_call["id"]
-
-                if on_tool_call:
-                    on_tool_call(tool_name, tool_args)
-
-                _, result = await self.executor.execute_tool(
-                    tool_name, tool_args, tool_id
+            try:
+                # Hook: ON_LLM_CALL
+                llm_ctx = self._create_hook_context(
+                    HookPosition.ON_LLM_CALL,
+                    iteration=iteration,
                 )
+                hook_result = await self._execute_hook(HookPosition.ON_LLM_CALL, llm_ctx)
 
-                self.context.add_message(Message.tool_result(
-                    tool_use_id=tool_id,
-                    content=result.content,
-                    is_error=result.is_error,
-                    name=result.tool_name
-                ))
+                if hook_result.is_retry():
+                    await asyncio.sleep(hook_result.data.get("after_seconds", 0))
+                    iteration -= 1
+                    continue
+
+                if hook_result.is_abort():
+                    yield hook_result.message or "Execution aborted by hook"
+                    return
+
+                # Stream completion from LLM
+                async for chunk in self.provider.stream(
+                    messages=self.context.get_api_messages(),
+                    tools=self.context.get_tools_api_format(),
+                    model=self.config.model,
+                    temperature=self.config.temperature,
+                    max_tokens=self.config.max_tokens
+                ):
+                    # Check if it's a text chunk or tool call info
+                    if isinstance(chunk, dict):
+                        if "text" in chunk:
+                            text = chunk["text"]
+                            full_response += text
+                            yield text
+                        elif "tool_call" in chunk:
+                            tool_calls.append(chunk["tool_call"])
+                    elif isinstance(chunk, str):
+                        full_response += chunk
+                        yield chunk
+
+                # Hook: ON_LLM_RESPONSE
+                resp_ctx = self._create_hook_context(
+                    HookPosition.ON_LLM_RESPONSE,
+                    iteration=iteration,
+                    llm_response={"text": full_response, "tool_calls": tool_calls},
+                )
+                await self._execute_hook(HookPosition.ON_LLM_RESPONSE, resp_ctx)
+
+                # Add assistant message
+                if full_response:
+                    self.context.add_assistant_message(full_response)
+
+                # If no tool calls, we're done
+                if not tool_calls:
+                    break
+
+                # Execute tool calls
+                for tool_call in tool_calls:
+                    tool_name = tool_call["name"]
+                    tool_args = tool_call["input"]
+                    tool_id = tool_call["id"]
+
+                    # Hook: ON_TOOL_CALL
+                    tool_ctx = self._create_hook_context(
+                        HookPosition.ON_TOOL_CALL,
+                        iteration=iteration,
+                        tool_name=tool_name,
+                        tool_arguments=tool_args,
+                    )
+                    hook_result = await self._execute_hook(HookPosition.ON_TOOL_CALL, tool_ctx)
+
+                    if hook_result.is_skip():
+                        continue
+
+                    if hook_result.is_abort():
+                        yield hook_result.message or "Execution aborted by hook"
+                        return
+
+                    if on_tool_call:
+                        on_tool_call(tool_name, tool_args)
+
+                    try:
+                        _, result = await self.executor.execute_tool(
+                            tool_name, tool_args, tool_id
+                        )
+
+                        # Hook: ON_TOOL_RESULT
+                        result_ctx = self._create_hook_context(
+                            HookPosition.ON_TOOL_RESULT,
+                            iteration=iteration,
+                            tool_name=tool_name,
+                            tool_arguments=tool_args,
+                            tool_result=result,
+                        )
+                        await self._execute_hook(HookPosition.ON_TOOL_RESULT, result_ctx)
+
+                        self.context.add_message(Message.tool_result(
+                            tool_use_id=tool_id,
+                            content=result.content,
+                            is_error=result.is_error,
+                            name=result.tool_name
+                        ))
+
+                    except Exception as e:
+                        # Hook: ON_ERROR
+                        error_ctx = self._create_hook_context(
+                            HookPosition.ON_ERROR,
+                            iteration=iteration,
+                            error=e,
+                            tool_name=tool_name,
+                        )
+                        hook_result = await self._execute_hook(HookPosition.ON_ERROR, error_ctx)
+
+                        if hook_result.is_retry():
+                            await asyncio.sleep(hook_result.data.get("after_seconds", 0))
+                            continue
+
+                        raise
+
+            finally:
+                # Hook: ON_ITERATION_END
+                end_ctx = self._create_hook_context(
+                    HookPosition.ON_ITERATION_END,
+                    iteration=iteration,
+                )
+                await self._execute_hook(HookPosition.ON_ITERATION_END, end_ctx)
 
             yield "\n[Tool execution completed, continuing...]\n"
+
+        # Hook: ON_RUN_END
+        end_ctx = self._create_hook_context(
+            HookPosition.ON_RUN_END,
+            message=full_response or "Stream completed",
+        )
+        await self._execute_hook(HookPosition.ON_RUN_END, end_ctx)
 
     def clear_history(self) -> None:
         """Clear conversation history but keep system prompt."""
