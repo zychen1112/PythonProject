@@ -20,6 +20,35 @@ from pyagent.hooks import (
     MetricsHook,
     RateLimitHook,
 )
+from pyagent.rag import (
+    # RAG Core
+    Document,
+    Chunk,
+    SearchResult,
+    RAGPipeline,
+    SimpleRAG,
+    create_rag_tool,
+    # Embeddings
+    DummyEmbedding,
+    FakeEmbedding,
+    OpenAIEmbedding,
+    LocalEmbedding,
+    # Vector Stores
+    MemoryVectorStore,
+    ChromaVectorStore,
+    # Chunking
+    FixedSizeChunker,
+    RecursiveChunker,
+    SemanticChunker,
+    # Retrievers
+    VectorRetriever,
+    KeywordRetriever,
+    HybridRetriever,
+    # Rerankers
+    IdentityReranker,
+    LLMReranker,
+    DiversityReranker,
+)
 
 __version__ = "0.1.0"
 __all__ = [
@@ -37,10 +66,31 @@ __all__ = [
     "HookPosition",
     "HookRegistry",
     "HookResult",
-    # Built-in hooks
     "LoggingHook",
     "TimingHook",
     "ErrorHandlingHook",
     "MetricsHook",
     "RateLimitHook",
+    # RAG
+    "Document",
+    "Chunk",
+    "SearchResult",
+    "RAGPipeline",
+    "SimpleRAG",
+    "create_rag_tool",
+    "DummyEmbedding",
+    "FakeEmbedding",
+    "OpenAIEmbedding",
+    "LocalEmbedding",
+    "MemoryVectorStore",
+    "ChromaVectorStore",
+    "FixedSizeChunker",
+    "RecursiveChunker",
+    "SemanticChunker",
+    "VectorRetriever",
+    "KeywordRetriever",
+    "HybridRetriever",
+    "IdentityReranker",
+    "LLMReranker",
+    "DiversityReranker",
 ]
