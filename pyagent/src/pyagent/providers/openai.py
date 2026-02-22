@@ -93,14 +93,22 @@ class OpenAIProvider(LLMProvider):
             result["message"] = Message.assistant(message.content)
 
         # Extract tool calls
+        import json
         if message.tool_calls:
             for tc in message.tool_calls:
+                # Safely parse arguments - never use eval()
+                if isinstance(tc.function.arguments, dict):
+                    args = tc.function.arguments
+                else:
+                    try:
+                        args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                    except json.JSONDecodeError:
+                        args = {}
+
                 result["tool_calls"].append({
                     "id": tc.id,
                     "name": tc.function.name,
-                    "input": tc.function.arguments
-                    if isinstance(tc.function.arguments, dict)
-                    else eval(tc.function.arguments)
+                    "input": args
                 })
 
         return result

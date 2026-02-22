@@ -34,6 +34,7 @@ class AgentConfig(BaseModel):
     """Configuration for an agent."""
     name: str = "PyAgent"
     max_iterations: int = 10
+    max_retries: int = 3  # Maximum retries per iteration to prevent infinite loops
     system_prompt: str | None = None
     model: str = "gpt-4"
     temperature: float = 0.7
@@ -242,9 +243,11 @@ class Agent:
 
         iteration = 0
         final_response = None
+        retry_count = 0  # Track retries to prevent infinite loops
 
         while iteration < self.config.max_iterations:
             iteration += 1
+            retry_count = 0  # Reset retry count for each iteration
 
             # Hook: ON_ITERATION_START
             iter_ctx = self._create_hook_context(
@@ -264,7 +267,10 @@ class Agent:
                 hook_result = await self._execute_hook(HookPosition.ON_LLM_CALL, llm_ctx)
 
                 if hook_result.is_retry():
-                    # Handle retry
+                    # Handle retry with limit to prevent infinite loops
+                    retry_count += 1
+                    if retry_count > self.config.max_retries:
+                        return f"Max retries ({self.config.max_retries}) exceeded"
                     await asyncio.sleep(hook_result.data.get("after_seconds", 0))
                     iteration -= 1  # Retry same iteration
                     continue
@@ -427,9 +433,11 @@ class Agent:
         await self._execute_hook(HookPosition.ON_MESSAGE, msg_ctx)
 
         iteration = 0
+        retry_count = 0  # Track retries to prevent infinite loops
 
         while iteration < self.config.max_iterations:
             iteration += 1
+            retry_count = 0  # Reset retry count for each iteration
 
             # Hook: ON_ITERATION_START
             iter_ctx = self._create_hook_context(
@@ -453,6 +461,11 @@ class Agent:
                 hook_result = await self._execute_hook(HookPosition.ON_LLM_CALL, llm_ctx)
 
                 if hook_result.is_retry():
+                    # Handle retry with limit to prevent infinite loops
+                    retry_count += 1
+                    if retry_count > self.config.max_retries:
+                        yield f"Max retries ({self.config.max_retries}) exceeded"
+                        return
                     await asyncio.sleep(hook_result.data.get("after_seconds", 0))
                     iteration -= 1
                     continue

@@ -97,9 +97,12 @@ class Context(BaseModel):
             system_messages = [m for m in self.messages if m.role.value == "system"]
             other_messages = [m for m in self.messages if m.role.value != "system"]
 
-            # Keep last N non-system messages
-            keep_count = self.max_messages - len(system_messages)
-            other_messages = other_messages[-keep_count:]
+            # Keep last N non-system messages (ensure non-negative)
+            keep_count = max(0, self.max_messages - len(system_messages))
+            if keep_count > 0:
+                other_messages = other_messages[-keep_count:]
+            else:
+                other_messages = []
 
             self.messages = system_messages + other_messages
 

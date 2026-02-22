@@ -139,10 +139,20 @@ class ChromaVectorStore(BaseVectorStore):
         if results and results["ids"] and results["ids"][0]:
             for i, chunk_id in enumerate(results["ids"][0]):
                 metadata = results["metadatas"][0][i] if results["metadatas"] else {}
+                # Extract values before modifying metadata
+                document_id = metadata.get("document_id", "")
+                start_index = metadata.get("start_index", 0)
+                end_index = metadata.get("end_index", 0)
+                # Create a copy for chunk metadata, excluding internal fields
+                chunk_metadata = {k: v for k, v in metadata.items()
+                                  if k not in ("document_id", "start_index", "end_index")}
                 chunk = Chunk(
-                    id=chunk_id, document_id=metadata.pop("document_id", ""),
-                    content=results["documents"][0][i], metadata=metadata,
-                    start_index=metadata.pop("start_index", 0), end_index=metadata.pop("end_index", 0)
+                    id=chunk_id,
+                    document_id=document_id,
+                    content=results["documents"][0][i],
+                    metadata=chunk_metadata,
+                    start_index=start_index,
+                    end_index=end_index
                 )
                 distance = results["distances"][0][i] if results["distances"] else 0
                 score = 1 - distance
